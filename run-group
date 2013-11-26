@@ -1,0 +1,430 @@
+#!/usr/bin/perl
+#
+# Run a command (as a child process) and timeout if the command doesn't finish
+# within a specified amount of time.  If the command launches any children of
+# its own, track those children (using process groups) to make sure those
+# children all finish when the parent finishes, too.
+#
+
+# This software is distributed under the "Simplified BSD license":
+#
+# Copyright Michael Cook <michael@waxrat.com>. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#    1. Redistributions of source code must retain the above copyright notice,
+#       this list of conditions and the following disclaimer.
+#
+#    2. Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in the
+#       documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY MICHAEL COOK ''AS IS'' AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO
+# EVENT SHALL MICHAEL COOK OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+# INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+# THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# The views and conclusions contained in the software and documentation are
+# those of the authors and should not be interpreted as representing official
+# policies, either expressed or implied, of Michael Cook.
+
+use strict;
+use warnings;
+use Getopt::Long;
+use POSIX qw(setsid SIGHUP SIGINT SIGPIPE SIGQUIT SIGTERM SIGKILL WNOHANG);
+
+my $THIS = $0; $THIS =~ s%^.*/%%;
+my $USAGE = "usage: $THIS [--timeout=300] [var=val...] [--command=]command [args...]\n";
+
+my $COMMAND;
+my $TIMEOUT = 0;
+my $SLACK = 0;
+my $OUTPUT;
+my $KIDS;
+my $DEBUG;
+
+sub seconds
+{
+    local $_ = shift;
+
+    return $1 if /^(\d+)s?$/i;
+    return $1 * 60 if /^(\d+)m$/i;
+    return $1 * 60 * 60 if /^(\d+)h$/i;
+    die "invalid number of seconds '$_'";
+}
+
+Getopt::Long::config("bundling", "require_order");
+GetOptions
+("timeout|t=s" => sub { $TIMEOUT = seconds($_[1]) },
+ #
+ # The maximum number of seconds the command and all of its children to
+ # complete.  Zero (the default) is to wait indefinitely.
+ #
+
+ "command|c=s" => \$COMMAND,
+ #
+ # The name of the program to run.  By default, the first argument is the name
+ # of the program to run.
+ #
+
+ "slack|s=s" => sub { $SLACK = seconds($_[1]) },
+ #
+ # If the command launched children, then ideally those children would have
+ # been terminated by the command before the command itself exited.  In
+ # practice, it is not always easy to get all children to exit in the right
+ # order (especially when grandchildren are involved).  We cut them some slack
+ # on when they exit.
+ #
+
+ "output|o=s" => \$OUTPUT,
+ #
+ # Where to store the command's stdout and stderr output.
+ # The default is not to capture the output.
+ #
+
+ "kids|k=s" => \$KIDS,
+ #
+ # Don't check for the children processes, if any.  Instead, appends the
+ # process group identifier to the file $KIDS.  Later, run-group can be
+ # invoked again to wait for those $KIDS.
+ #
+ # For example, the sequence of invocations
+ #
+ #  run-group --kids=foo bar
+ #  run-group --kids=foo
+ #
+ # is roughly equivalent to the single invocation
+ #
+ #  run-group bar
+ #
+
+ "debug" => \$DEBUG,
+ #
+ # Debug mode.
+ #
+) or die $USAGE;
+
+warn "> timeout='$TIMEOUT'" if $DEBUG;
+
+++$|; # autoflush after each print
+
+my $exit = 0;
+
+unshift @ARGV, split / /, $COMMAND
+    if defined $COMMAND;
+
+# ----------------------------------------------------------------------------
+# We use setsid to create a new process group to try to track any
+# grandchildren processes that might get created.  But signals like SIGINT are
+# sent to the controlling tty's process group and don't reach the children
+# processes.  So we need to catch some signals and pass on the signal to the
+# children.
+
+my @pgids;
+sub propagate_signal
+{
+    my ($signame, $signum) = @_;
+    warn "> propagate_signal($signame,$signum) to @pgids\n" if $DEBUG;
+    my $any;
+    for my $pgid (@pgids)
+    {
+	if (kill -$signum, $pgid)
+	{
+	    warn "> Sent SIG$signame to process group $pgid\n" if $DEBUG;
+	    ++$any;
+	}
+	elsif ($! eq "No such process")
+	{
+	    warn "> Couldn't send SIG$signame to process group $pgid ($!)\n"
+		if $DEBUG;
+	}
+	else
+	{
+	    warn "Couldn't send SIG$signame to process group $pgid ($!)\n";
+	}
+    }
+    $any or die "No process groups to send SIG$signame";
+}
+$SIG{INT}  = sub { propagate_signal $_[0], &SIGINT() };
+$SIG{HUP}  = sub { propagate_signal $_[0], &SIGHUP() };
+$SIG{TERM} = sub { propagate_signal $_[0], &SIGTERM() };
+$SIG{PIPE} = sub { propagate_signal $_[0], &SIGPIPE() };
+# ----------------------------------------------------------------------------
+
+if (@ARGV)
+{
+    my $pgid = start_group(@ARGV);
+    push @pgids, $pgid;
+    if ($KIDS)
+    {
+	append_group($KIDS, $pgid);
+    }
+    else
+    {
+	finish_group($pgid);
+    }
+}
+else
+{
+    $KIDS or die $USAGE;
+    @pgids = read_groups($KIDS);
+    for my $pgid (@pgids)
+    {
+	finish_group($pgid);
+    }
+}
+exit $exit;
+
+sub append_group
+{
+    my ($file, $pgid) = @_;
+    #
+    # Append the process group identifier to the file.
+    #
+
+    open my $fh, ">>$file"
+	or die "open `$file': $!";
+    print $fh "$pgid\n"
+	or die "print `$file': $!";
+    close $fh
+	or die "close `$file': $!";
+    warn "> appended $pgid" if $DEBUG;
+}
+
+sub read_groups
+{
+    my ($file) = @_;
+    #
+    # Read all of the process group identifiers from the file.
+    #
+
+    my @pgids;
+    open my $fh, $file
+	or die "open `$file': $!";
+    while (<$fh>)
+    {
+	chomp;
+	unless (/^\d+$/)
+	{
+	    warn "invalid entry `$_'";
+	    next;
+	}
+	push @pgids, $_ + 0;
+    }
+    close $fh;
+    warn "> groups @pgids" if $DEBUG;
+    return @pgids;
+}
+
+sub start_group
+{
+    my (@cmd) = @_;
+    #
+    # Runs the given command in its own process group.  Waits for the command
+    # to finish.  Returns the process group identifier (in case any children
+    # are still running).
+    #
+
+    print "@cmd\n";
+
+    #
+    # Pick out any leading environment variable assignments.
+    #
+    my %env;
+    while (@cmd && $cmd[0] =~ /^(\w+)=(.*)/s)
+    {
+	$env{$1} = $2;
+	shift @cmd;
+    }
+    @cmd or die $USAGE;
+
+    my $kid = fork;
+    defined $kid or die "fork: $!";
+    unless ($kid)
+    {
+	%ENV = (%ENV, %env);
+
+	setsid or die "setsid: $!";
+
+	if ($OUTPUT)
+	{
+	    open STDOUT, ">$OUTPUT" or die "open `$OUTPUT': $!";
+	    open STDERR, ">&STDOUT" or die "dup: $!";
+	    print "'", join("' '", map({ "$_=$ENV{$_}" } keys %ENV), @cmd),
+		  "'\n";
+	}
+
+	exec { $cmd[0] } @cmd
+	    or die "exec `$cmd[0]': $!";
+    }
+    return $kid;
+}
+
+sub reap_zombies
+{
+    #
+    # See if any children processes have terminated recently.
+    #
+    for (;;)
+    {
+	my $kid = waitpid -1, WNOHANG;
+	last if $kid <= 0;
+	warn "> waitpid $kid" if $DEBUG;
+    }
+}
+
+sub wait_for_group
+{
+    my ($pgid, $seconds, $quiet) = @_;
+    #
+    # Returns true if the process group has finished within $seconds.
+    # Returns false otherwise.
+    #
+
+    my $deadline = time() + $seconds;
+    for (;;)
+    {
+	reap_zombies;
+	my @ps = `ps -ww -s $pgid -o pid,sid,pgid,args`;
+	my $header = shift @ps;
+	unless (@ps)
+	{
+	    warn "> process group $pgid is gone" if $DEBUG;
+	    return 1;
+	}
+	if (time() > $deadline)
+	{
+	    unless ($quiet)
+	    {
+		warn "$THIS: Process group $pgid is still running:\n";
+		warn $header, @ps;
+	    }
+	    return 0;
+	}
+	sleep 1;
+    }
+}
+
+sub finish_group
+{
+    my ($pgid) = @_;
+
+    warn "> waiting for main process $pgid" if $DEBUG;
+    my $ok = 0;
+    {
+	local $SIG{ALRM} = sub { die "SIGALRM" };
+	eval
+	{
+	    alarm $TIMEOUT
+		if $TIMEOUT;
+	    my $wait = waitpid $pgid, 0;
+	    alarm 0;
+	    $ok = 1
+		if $wait == $pgid && $? == 0;
+	    warn "> wait=$wait, ?=$?" if $DEBUG;
+	};
+	warn $@
+	    if $@ && $@ !~ /^SIGALRM/;
+    }
+    warn "> ok=$ok" if $DEBUG;
+    $exit = 1
+	unless $ok;
+
+    #
+    # Make sure the command (and all its children and grandchildren, if any)
+    # has terminated.  If the command launched children, then ideally those
+    # children would have been terminated by the command before the command
+    # itself exited.  In practice, it is not always easy to get all children
+    # to exit in the right order (especially when grandchildren are involved).
+    # We do require that all processes exit.  But we cut them some slack on
+    # when they exit.
+    #
+    if (wait_for_group $pgid, $SLACK)
+    {
+	warn "> done" if $DEBUG;
+	return;
+    }
+    $exit = 1;
+    #
+    # The process group is still running.  Send it a SIGQUIT.  (If the command
+    # is a java process, the signal will tend to generate a thread dump.
+    # Otherwise, the signal will tend to generate a core dump.)
+    #
+    if (kill -&SIGQUIT(), $pgid) # "-" means the whole process group.
+    {
+	warn "$THIS: Sent SIGQUIT to process group $pgid.\n";
+	#
+	# The SIGQUIT may have ended the processes.  If so, then we're done.
+	# Otherwise, give the process a chance to react before sending
+	# SIGTERM.
+	#
+	if (wait_for_group $pgid, 30, 1)
+	{
+	    warn "> done" if $DEBUG;
+	    return;
+	}
+    }
+    elsif ($! eq "No such process")
+    {
+	warn "> process group $pgid seems to have exited" if $DEBUG;
+    }
+    else
+    {
+	die "$THIS: kill process group $pgid: $!\n";
+    }
+    #
+    # The process group is still running.  Send SIGTERM.
+    #
+    if (kill -&SIGTERM(), $pgid) # "-" means the whole process group.
+    {
+	warn "$THIS: Sent SIGTERM to process group $pgid.\n";
+	#
+	# The SIGTERM may have ended the processes.  If so, then we're done.
+	# Otherwise, give the process a chance to react before sending
+	# SIGKILL.
+	#
+	if (wait_for_group $pgid, 30, 1)
+	{
+	    warn "> done" if $DEBUG;
+	    return;
+	}
+    }
+    elsif ($! eq "No such process")
+    {
+	warn "> process group $pgid seems to have exited" if $DEBUG;
+    }
+    else
+    {
+	die "$THIS: kill process group $pgid: $!\n";
+    }
+    #
+    # The process group is still running.  Send SIGKILL.
+    #
+    if (kill -&SIGKILL(), $pgid) # "-" means the whole process group.
+    {
+	warn "$THIS: Sent SIGKILL to process group $pgid.\n";
+	#
+	# The SIGKILL may have ended the processes.  If so, then we're done.
+	#
+	if (wait_for_group $pgid, 30, 1)
+	{
+	    warn "> done" if $DEBUG;
+	    return;
+	}
+    }
+    elsif ($! eq "No such process")
+    {
+	warn "> process group $pgid seems to have exited" if $DEBUG;
+    }
+    else
+    {
+	die "$THIS: kill process group $pgid: $!\n";
+    }
+}
