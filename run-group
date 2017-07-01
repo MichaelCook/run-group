@@ -186,11 +186,11 @@ sub append_group
     #
 
     open my $fh, ">>$file"
-	or die "open `$file': $!";
+	or die "open '$file': $!";
     print $fh "$pgid\n"
-	or die "print `$file': $!";
+	or die "print '$file': $!";
     close $fh
-	or die "close `$file': $!";
+	or die "close '$file': $!";
     warn "> appended $pgid" if $DEBUG;
 }
 
@@ -203,13 +203,13 @@ sub read_groups
 
     my @pgids;
     open my $fh, $file
-	or die "open `$file': $!";
+	or die "open '$file': $!";
     while (<$fh>)
     {
 	chomp;
 	unless (/^\d+$/)
 	{
-	    warn "invalid entry `$_'";
+	    warn "invalid entry '$_'";
 	    next;
 	}
 	push @pgids, $_ + 0;
@@ -251,14 +251,14 @@ sub start_group
 
 	if ($OUTPUT)
 	{
-	    open STDOUT, ">$OUTPUT" or die "open `$OUTPUT': $!";
+	    open STDOUT, ">$OUTPUT" or die "open '$OUTPUT': $!";
 	    open STDERR, ">&STDOUT" or die "dup: $!";
 	    print "'", join("' '", map({ "$_=$ENV{$_}" } keys %ENV), @cmd),
 		  "'\n";
 	}
 
 	exec { $cmd[0] } @cmd
-	    or die "exec `$cmd[0]': $!";
+	    or die "exec '$cmd[0]': $!";
     }
     return $kid;
 }
