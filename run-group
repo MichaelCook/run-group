@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/env perl
 #
 # Run a command (as a child process) and timeout if the command doesn't finish
 # within a specified amount of time.  If the command launches any children of
@@ -102,9 +102,6 @@ GetOptions
  #
 
  "debug" => \$DEBUG,
- #
- # Debug mode.
- #
 ) or die $USAGE;
 
 warn "> timeout='$TIMEOUT'" if $DEBUG;
